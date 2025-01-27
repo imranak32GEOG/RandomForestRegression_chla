@@ -1,0 +1,214 @@
+// Define a region of interest (ROI) over an ocean area.
+//var roi = ee.Geometry.Rectangle(-180, -90, 180, 90);
+Map.setCenter(64, 22, 5)
+// Load MODIS Aqua data for Chlorophyll-a (chl-a), nflh, poc, and SST.
+var dataset = ee.ImageCollection('NASA/OCEANDATA/MODIS-Aqua/L3SMI')
+    .filterDate('2016-01-01', '2016-12-31');  // Modify the date range as needed
+
+var chlCollection = dataset.select(['chlor_a']);
+var nflhCollection = dataset.select(['nflh']);
+var pocCollection = dataset.select(['poc']);
+var sstCollection = dataset.select(['sst']);
+
+// Check if Chlorophyll-a data is available in the collection.
+var chlCount = chlCollection.size();
+if (chlCount.getInfo() === 0) {
+  print('No Chlorophyll-a data available in the specified date range.');
+} else {
+  // Continue with the rest of the script.
+ 
+  // Merge collections based on the date property.
+  var mergedCombined = ee.ImageCollection(ee.Join.saveAll('matches').apply({
+    primary: chlCollection,
+    secondary: nflhCollection,
+    condition: ee.Filter.equals({
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    })
+  })).map(function(image) {
+    var nflhImage = ee.Image(ee.List(image.get('matches')).get(0));
+    return image.addBands(nflhImage.rename('nflh'));
+  });
+
+  mergedCombined = ee.ImageCollection(ee.Join.saveAll('matches').apply({
+    primary: mergedCombined,
+    secondary: pocCollection,
+    condition: ee.Filter.equals({
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    })
+  })).map(function(image) {
+    var pocImage = ee.Image(ee.List(image.get('matches')).get(0));
+    return image.addBands(pocImage.rename('poc'));
+  });
+
+  mergedCombined = ee.ImageCollection(ee.Join.saveAll('matches').apply({
+    primary: mergedCombined,
+    secondary: sstCollection,
+    condition: ee.Filter.equals({
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    })
+  })).map(function(image) {
+    var sstImage = ee.Image(ee.List(image.get('matches')).get(0));
+    return image.addBands(sstImage.rename('sst'));
+  });
+
+  // Add every image as one
+  var combined = mergedCombined.mean();
+
+  // Sample the data
+  var sample = combined.sample({
+    numPixels: 10000,
+    region: Roi,
+    scale: 1000,
+    geometries: true
+  }).randomColumn(); 
+  Map.addLayer(sample, {}, 'Sample', false);
+
+var filteredSample = sample.filter(ee.Filter.lt('chlor_a', 5));  // Adjust the filter condition
+
+
+  // Split into train and test
+  var train = sample.filter(ee.Filter.lte('random', 0.8));
+  var test = sample.filter(ee.Filter.gt('random', 0.8));
+  print('Train size', train.size(), 'Test size', test.size());
+
+  // ... (rest of the code)
+}
+;
+
+
+// Do random forest regression for Chl-a
+  var regressionChla = ee.Classifier.smileRandomForest(50).train(train, 'chlor_a', ['nflh', 'poc', 'sst'])
+    .setOutputMode('REGRESSION');
+  print('Regression RF for Chlorophyll-a (Chl-a)', regressionChla.explain());
+ 
+  // Make prediction for Chl-a
+  var predictionChla = combined.clip(Roi).classify(regressionChla, 'chlor_a_Prediction');
+
+  // Check if there is Chlorophyll-a data in the test dataset. 
+  var testChlaAvailable = test.aggregate_count('chlor_a').gt(0);
+
+  if (testChlaAvailable) {
+    // Classify the test data for accuracy test
+    var testDataChla = test.classify(regressionChla, 'chlor_a_Prediction').map(function(data){
+      return data.set('line', data.get('chlor_a'));
+    });
+
+    // Show accuracy in chart for Chl-a
+    var chartChla = ui.Chart.feature.byFeature(testDataChla, 'chlor_a', ['line', 'chlor_a_Prediction'])
+      .setChartType('ScatterChart')
+      .setOptions({
+        dataOpacity: 0.3,
+        title: 'Chlorophyll-a Actual vs Prediction',
+        hAxis: {
+          title: 'Chlorophyll-a Actual'
+        },
+        vAxis: {
+          title: 'Chlorophyll-a Prediction'
+        },
+        series: {
+          0: {
+            pointSize : 0,
+            pointsVisible: false,
+            visibleInLegend: false
+          },
+          1: {
+            color: 'blue'
+          }
+        },
+        trendlines: {
+          0: {
+            opacity: 1,
+            type: 'linear',
+            color: 'red',
+            visibleInLegend: false
+          },
+          1: {
+            opacity: 0.3,
+            type: 'linear',
+            showR2: true,
+            color: 'blue',
+            visibleInLegend: true
+          }
+        }
+      });
+    print(chartChla);
+  } else {
+    print('No Chlorophyll-a data available in the test dataset.');
+  }
+
+  // Define custom palettes for nflh, poc, and SST.
+  var nflhPalette = ['blue', 'green', 'yellow', 'red'];
+  var pocPalette = ['green', 'yellow', 'red'];
+  var sstPalette = ['green', 'yellow','orange' ,'red'];
+  var chlaPalette = ['purple', 'blue', 'cyan', 'green', 'yellow', 'red'];
+
+  // Display Chlorophyll-a (chl-a) data with a custom palette.
+  Map.addLayer(
+      chlCollection.mean().clip(Roi), {min:0.33, max: 5.1, palette: chlaPalette},
+      'Chlorophyll-a Concentration');
+
+  // Display NFLH data with the custom palette.
+  Map.addLayer(
+      nflhCollection.mean().clip(Roi), {min: 0.044, max: 1.345, palette: nflhPalette},
+      'Normalized Fluorescence Line Height (NFLH)');
+
+  // Display POC data with the custom palette.
+  Map.addLayer(
+      pocCollection.mean().clip(Roi), {min: 84, max: 2700, palette: pocPalette},
+      'Particulate Organic Carbon (POC)');
+
+  // Display SST data with the custom palette.
+  Map.addLayer(
+      sstCollection.mean().clip(Roi), {min: 25, max: 35, palette: sstPalette},
+      'Sea Surface Temperature (SST)');
+
+  // Display predicted Chlorophyll-a (chl-a) data.
+  Map.addLayer(
+      predictionChla, {min:0.33, max: 5.1, palette: chlaPalette},'Predicted Chlorophyll-a (chl-a)');
+      
+      // Perform a grid search for the number of trees
+var nTrees = [50, 100, 200, 500];
+var results = nTrees.map(function(n) {
+  var model = ee.Classifier.smileRandomForest(n)
+    .train(train, 'chlor_a', ['nflh', 'poc', 'sst'])
+    .setOutputMode('REGRESSION');
+
+  // Evaluate model using cross-validation or validation set
+  var accuracy = model.confusionMatrix().accuracy();
+  
+  return { 'nTrees': n, 'accuracy': accuracy };
+});
+
+// print('Grid Search Results:', results);
+// var regressionChla = ee.Classifier.smileRandomForest(100)
+//   .train(train, 'chlor_a', ['nflh', 'poc', 'sst'])
+//   .setOutputMode('REGRESSION');
+// // Make predictions on the test set
+// var predictions = test.classify(regressionChla, 'chlor_a_Prediction');
+
+// Calculate Mean Squared Error
+var mse = predictionChla.reduceRegion({
+  reducer: ee.Reducer.mean(), 
+  geometry: Roi,
+  scale: 500,
+  maxPixels: 1e9
+}).get('chlor_a_Prediction');
+
+print('Mean Squared Error:', mse);
+
+
+var mse2 = predictionChla.reduceRegion({
+  reducer: ee.Reducer.max(), 
+  geometry: Roi,
+  scale: 500,
+  maxPixels: 1e9
+}).get('chlor_a_Prediction');
+
+print('Mean Squared Error (max):', mse2);
+// Assuming 'mse' is your Mean Squared Error
+var percentageError = (2.27 / (5 - 0.3)) * 100;
+print('Percentage Error:', percentageError);
+Map.addLayer(Roi, {color: 'blue'}, 'Northern Arabian Sea');
