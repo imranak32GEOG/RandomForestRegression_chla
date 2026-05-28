@@ -1,1 +1,965 @@
+# ============================================================
+# 1. INSTALL & IMPORT
+# ============================================================
+!pip install geemap earthengine-api
 
+import ee
+import geemap
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+
+ee.Authenticate()
+ee.Initialize(project='ee-imranak32ab')
+
+
+# ============================================================
+# 2. REGION OF INTEREST (NORTHERN ARABIAN SEA)
+# ============================================================
+roi = ee.Geometry.Polygon([
+    [[60.8383, 19.4404],
+     [71.4731, 19.4404],
+     [71.4731, 25.7649],
+     [60.8383, 25.7649],
+     [60.8383, 19.4404]]
+])
+
+
+# ============================================================
+# 3. DATA (MODIS AQUA 2016)
+# ============================================================
+dataset = ee.ImageCollection("NASA/OCEANDATA/MODIS-Aqua/L3SMI") \
+    .filterDate("2016-01-01", "2016-12-31") \
+    .filterBounds(roi)
+
+img = dataset.mean().clip(roi)
+
+chl  = img.select("chlor_a")
+sst  = img.select("sst")
+nflh = img.select("nflh")
+poc  = img.select("poc")
+
+
+# ============================================================
+# 4. TRAINING DATA
+# ============================================================
+combined = img
+
+sample = combined.sample(
+    region=roi,
+    scale=4000,
+    numPixels=10000,
+    geometries=True
+).randomColumn("random")
+
+sample = sample.filter(ee.Filter.lt("chlor_a", 5))
+
+train = sample.filter(ee.Filter.lte("random", 0.8))
+test  = sample.filter(ee.Filter.gt("random", 0.8))
+
+bands = ["nflh", "poc", "sst"]
+
+
+# ============================================================
+# 5. RANDOM FOREST MODEL (REGRESSION)
+# ============================================================
+rf = ee.Classifier.smileRandomForest(
+    numberOfTrees=100,
+    variablesPerSplit=None,
+    minLeafPopulation=1,
+    bagFraction=0.7,
+    seed=42
+).setOutputMode("REGRESSION") \
+    .train(train, "chlor_a", bands)
+
+# ============================================================
+# 6. PREDICTION
+# ============================================================
+predicted = img.classify(rf, "pred").clip(roi)
+
+
+# ============================================================
+# 7. CONVERT TO NUMPY
+# ============================================================
+def to_array(image):
+    return geemap.ee_to_numpy(image, region=roi, scale=4000)
+
+chl_arr  = to_array(chl)
+sst_arr  = to_array(sst)
+nflh_arr = to_array(nflh)
+poc_arr  = to_array(poc)
+pred_arr = to_array(predicted)
+
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+
+def add_latlon(ax):
+    ax.set_xticks(np.linspace(0, chl_arr.shape[1], 5))
+    ax.set_yticks(np.linspace(0, chl_arr.shape[0], 5))
+    ax.set_xticklabels(np.round(np.linspace(extent[0], extent[1], 5), 2))
+    ax.set_yticklabels(np.round(np.linspace(extent[2], extent[3], 5), 2))
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+
+# ============================================================
+# 8. PAPER MAPS
+# ============================================================
+fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+
+axs[0,0].imshow(chl_arr, cmap="viridis"); axs[0,0].set_title("Chl-a"); add_latlon(axs[0,0])
+axs[0,1].imshow(sst_arr, cmap="plasma");  axs[0,1].set_title("SST"); add_latlon(axs[0,1])
+axs[0,2].imshow(nflh_arr, cmap="turbo");  axs[0,2].set_title("NFLH"); add_latlon(axs[0,2])
+
+axs[1,0].imshow(poc_arr, cmap="cividis"); axs[1,0].set_title("POC"); add_latlon(axs[1,0])
+im = axs[1,1].imshow(pred_arr, cmap="jet"); axs[1,1].set_title("Predicted Chl-a"); add_latlon(axs[1,1])
+
+axs[1,2].axis("off")
+
+plt.colorbar(im, ax=axs[1,1])
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 9. ACCURACY METRICS (RMSE, R², MAE)
+# ============================================================
+test_pred = test.classify(rf, "pred").getInfo()["features"]
+
+y_true = np.array([f["properties"]["chlor_a"] for f in test_pred])
+y_pred = np.array([f["properties"]["pred"] for f in test_pred])
+
+rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+mae  = np.mean(np.abs(y_true - y_pred))
+r2   = np.corrcoef(y_true, y_pred)[0,1]**2
+
+print("RMSE:", rmse)
+print("MAE:", mae)
+print("R²:", r2)
+
+
+# ============================================================
+# 10. GRAPHICAL CORRELATION
+# ============================================================
+min_val = min(y_true.min(), y_pred.min())
+max_val = max(y_true.max(), y_pred.max())
+
+fig, ax = plt.subplots(figsize=(7,7))
+
+ax.scatter(y_true, y_pred, s=12, alpha=0.5)
+ax.plot([min_val, max_val], [min_val, max_val], "r--")
+
+ax.set_xlabel("Observed Chl-a")
+ax.set_ylabel("Predicted Chl-a")
+ax.set_title("Observed vs Predicted")
+
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 11. RESIDUAL ANALYSIS
+# ============================================================
+residuals = y_pred - y_true
+
+fig, ax = plt.subplots(figsize=(7,5))
+
+ax.scatter(y_pred, residuals, s=10)
+ax.axhline(0, color="red", linestyle="--")
+
+ax.set_title("Residual Analysis")
+ax.set_xlabel("Predicted")
+ax.set_ylabel("Residual")
+
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 12. ERROR DISTRIBUTION
+# ============================================================
+fig, ax = plt.subplots(figsize=(7,5))
+
+ax.hist(residuals, bins=30)
+ax.set_title("Error Distribution")
+ax.set_xlabel("Error")
+ax.set_ylabel("Frequency")
+
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 13. SPATIAL ERROR MAP (FIXED)
+# ============================================================
+
+fc = test.classify(rf)  # produces "classification"
+
+def add_error(f):
+    pred = ee.Number(f.get("classification"))
+    obs  = ee.Number(f.get("chlor_a"))
+
+    error = pred.subtract(obs)
+
+    return f.set("error", error)
+
+error_fc = fc.map(add_error)
+
+error_img = error_fc.reduceToImage(
+    properties=["error"],
+    reducer=ee.Reducer.mean()
+).clip(roi)
+
+error_arr = geemap.ee_to_numpy(error_img, region=roi, scale=4000)
+
+fig, ax = plt.subplots(figsize=(7,6))
+im = ax.imshow(error_arr, cmap="RdBu", vmin=-2, vmax=2)
+ax.set_title("Spatial Error Map")
+plt.colorbar(im, ax=ax)
+plt.show()
+
+# ============================================================
+# 14. FEATURE IMPORTANCE
+# ============================================================
+importance = rf.explain().getInfo()["importance"]
+
+imp_df = pd.DataFrame({
+    "Variable": list(importance.keys()),
+    "Importance": list(importance.values())
+}).sort_values("Importance")
+
+fig, ax = plt.subplots(figsize=(7,5))
+ax.barh(imp_df["Variable"], imp_df["Importance"])
+ax.set_title("Feature Importance")
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 15. UNCERTAINTY MAP (RF PROXY)
+# ============================================================
+uncertainty = combined.classify(rf).reduceNeighborhood(
+    reducer=ee.Reducer.stdDev(),
+    kernel=ee.Kernel.square(3)
+).clip(roi)
+
+uncert_arr = geemap.ee_to_numpy(uncertainty, region=roi, scale=4000)
+
+fig, ax = plt.subplots(figsize=(7,6))
+
+im = ax.imshow(uncert_arr, cmap="magma")
+ax.set_title("Prediction Uncertainty")
+
+plt.colorbar(im, ax=ax)
+plt.show()
+
+
+# ============================================================
+# 8. SEPARATE PUBLICATION MAPS
+# ============================================================
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+def add_latlon(ax, arr):
+    ax.set_xticks(np.linspace(0, arr.shape[1]-1, 5))
+    ax.set_yticks(np.linspace(0, arr.shape[0]-1, 5))
+
+    ax.set_xticklabels(
+        np.round(np.linspace(extent[0], extent[1], 5), 2),
+        fontsize=10
+    )
+
+    ax.set_yticklabels(
+        np.round(np.linspace(extent[2], extent[3], 5), 2),
+        fontsize=10
+    )
+
+    ax.set_xlabel("Longitude", fontsize=12)
+    ax.set_ylabel("Latitude", fontsize=12)
+
+
+def plot_map(data, title, cmap, cbar_label):
+
+    fig, ax = plt.subplots(figsize=(8,8))
+
+    im = ax.imshow(
+        np.squeeze(data),
+        cmap=cmap,
+        origin="upper"
+    )
+
+    add_latlon(ax, np.squeeze(data))
+
+    ax.set_title(
+        title,
+        fontsize=15,
+        weight="bold"
+    )
+
+    cbar = plt.colorbar(
+        im,
+        ax=ax,
+        shrink=0.85
+    )
+
+    cbar.set_label(
+        cbar_label,
+        fontsize=11
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# CHLOROPHYLL-A
+# ============================================================
+plot_map(
+    chl_arr,
+    "Chlorophyll-a Concentration",
+    "jet",
+    "mg m$^{-3}$"
+)
+
+
+# ============================================================
+# SST
+# ============================================================
+plot_map(
+    sst_arr,
+    "Sea Surface Temperature (SST)",
+    "jet",
+    "°C"
+)
+
+
+# ============================================================
+# NFLH
+# ============================================================
+plot_map(
+    nflh_arr,
+    "Normalized Fluorescence Line Height (NFLH)",
+    "jet",
+    "mW cm$^{-2}$ μm$^{-1}$ sr$^{-1}$"
+)
+
+
+# ============================================================
+# POC
+# ============================================================
+plot_map(
+    poc_arr,
+    "Particulate Organic Carbon (POC)",
+   "jet",
+    "mg m$^{-3}$"
+)
+
+
+# ============================================================
+# PREDICTED CHL-A
+# ============================================================
+plot_map(
+    pred_arr,
+    "Predicted Chlorophyll-a",
+    "jet",
+    "mg m$^{-3}$"
+)
+
+title = 'My Saved Plot Title'
+plt.savefig(
+    title.replace(" ","_")+".png",
+    dpi=600,
+    bbox_inches="tight"
+)
+
+
+# ============================================================
+# 13. SPATIAL ERROR MAP (FIXED)
+# ============================================================
+
+fc = test.classify(rf)  # produces "classification"
+
+def add_error(f):
+    pred = ee.Number(f.get("classification"))
+    obs  = ee.Number(f.get("chlor_a"))
+
+    error = pred.subtract(obs)
+
+    return f.set("error", error)
+
+error_fc = fc.map(add_error)
+
+error_img = error_fc.reduceToImage(
+    properties=["error"],
+    reducer=ee.Reducer.mean()
+).clip(roi)
+
+error_arr = geemap.ee_to_numpy(error_img, region=roi, scale=4000)
+
+fig, ax = plt.subplots(figsize=(7,6))
+im = ax.imshow(error_arr, cmap="RdBu", vmin=-2, vmax=2)
+ax.set_title("Spatial Error Map")
+plt.colorbar(im, ax=ax)
+plt.show()
+
+
+
+
+
+# ============================================================
+# 15. UNCERTAINTY MAP (RF PROXY)
+# ============================================================
+uncertainty = combined.classify(rf).reduceNeighborhood(
+    reducer=ee.Reducer.stdDev(),
+    kernel=ee.Kernel.square(3)
+).clip(roi)
+
+uncert_arr = geemap.ee_to_numpy(uncertainty, region=roi, scale=4000)
+
+fig, ax = plt.subplots(figsize=(7,6))
+
+im = ax.imshow(uncert_arr, cmap="magma")
+ax.set_title("Prediction Uncertainty")
+
+plt.colorbar(im, ax=ax)
+plt.show()
+
+# ============================================================
+# 13. SPATIAL ERROR MAP (PUBLICATION STYLE)
+# ============================================================
+
+fc = test.classify(rf)   # default output = classification
+
+
+def add_error(f):
+
+    pred = ee.Number(f.get("classification"))
+    obs  = ee.Number(f.get("chlor_a"))
+
+    return f.set(
+        "error",
+        pred.subtract(obs)
+    )
+
+
+error_fc = fc.map(add_error)
+
+error_img = (
+    error_fc
+    .reduceToImage(
+        properties=["error"],
+        reducer=ee.Reducer.mean()
+    )
+    .clip(roi)
+)
+
+error_arr = geemap.ee_to_numpy(
+    error_img,
+    region=roi,
+    scale=4000
+)
+
+
+plot_map(
+    error_arr,
+    "Spatial Error Map",
+    "RdBu",
+    "Prediction Error"
+)
+
+
+
+# ============================================================
+# 15. UNCERTAINTY MAP (PUBLICATION STYLE)
+# ============================================================
+
+uncertainty = (
+    combined
+    .classify(rf)
+    .reduceNeighborhood(
+        reducer=ee.Reducer.stdDev(),
+        kernel=ee.Kernel.square(3)
+    )
+    .clip(roi)
+)
+
+uncert_arr = geemap.ee_to_numpy(
+    uncertainty,
+    region=roi,
+    scale=4000
+)
+
+
+plot_map(
+    uncert_arr,
+    "Prediction Uncertainty",
+    "magma",
+    "Std. Dev."
+)
+
+# ============================================================
+# 8. SEPARATE PUBLICATION MAPS
+# ============================================================
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+def add_latlon(ax, arr):
+
+    ax.set_xticks(np.linspace(0, arr.shape[1]-1, 5))
+    ax.set_yticks(np.linspace(0, arr.shape[0]-1, 5))
+
+    ax.set_xticklabels(
+        np.round(np.linspace(extent[0], extent[1], 5), 2),
+        fontsize=10
+    )
+
+    ax.set_yticklabels(
+        np.round(np.linspace(extent[2], extent[3], 5), 2),
+        fontsize=10
+    )
+
+    ax.set_xlabel("Longitude", fontsize=12)
+    ax.set_ylabel("Latitude", fontsize=12)
+
+
+def plot_map(data, title, cmap, cbar_label,
+             vmin=None, vmax=None):
+
+    fig, ax = plt.subplots(figsize=(8,8))
+
+    im = ax.imshow(
+        np.squeeze(data),
+        cmap=cmap,
+        origin="upper",
+        vmin=vmin,
+        vmax=vmax
+    )
+
+    add_latlon(ax, np.squeeze(data))
+
+    ax.set_title(
+        title,
+        fontsize=15,
+        weight="bold"
+    )
+
+    cbar = plt.colorbar(
+        im,
+        ax=ax,
+        shrink=0.85
+    )
+
+    cbar.set_label(
+        cbar_label,
+        fontsize=11
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# CHLOROPHYLL-A (0–8)
+# ============================================================
+plot_map(
+    chl_arr,
+    "Chlorophyll-a Concentration",
+    "jet",
+    "mg m$^{-3}$",
+    vmin=0,
+    vmax=4
+)
+
+
+# ============================================================
+# SST
+# ============================================================
+plot_map(
+    sst_arr,
+    "Sea Surface Temperature (SST)",
+    "jet",
+    "°C"
+)
+
+
+# ============================================================
+# NFLH
+# ============================================================
+plot_map(
+    nflh_arr,
+    "Normalized Fluorescence Line Height (NFLH)",
+    "jet",
+    "mW cm$^{-2}$ μm$^{-1}$ sr$^{-1}$"
+)
+
+
+# ============================================================
+# POC
+# ============================================================
+plot_map(
+    poc_arr,
+    "Particulate Organic Carbon (POC)",
+    "jet",
+    "mg m$^{-3}$"
+)
+
+
+# ============================================================
+# PREDICTED CHL-A (0–8)
+# ============================================================
+plot_map(
+    pred_arr,
+    "Predicted Chlorophyll-a",
+    "jet",
+    "mg m$^{-3}$",
+    vmin=0,
+    vmax=4
+)
+
+# ============================================================
+# 8. SEPARATE PUBLICATION MAPS
+# ============================================================
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+def add_latlon(ax, arr):
+
+    ax.set_xticks(np.linspace(0, arr.shape[1]-1, 5))
+    ax.set_yticks(np.linspace(0, arr.shape[0]-1, 5))
+
+    ax.set_xticklabels(
+        np.round(np.linspace(extent[0], extent[1], 5), 2),
+        fontsize=10
+    )
+
+    ax.set_yticklabels(
+        np.round(np.linspace(extent[2], extent[3], 5), 2),
+        fontsize=10
+    )
+
+    ax.set_xlabel("Longitude", fontsize=12)
+    ax.set_ylabel("Latitude", fontsize=12)
+
+
+def plot_map(data, title, cmap, cbar_label,
+             vmin=None, vmax=None):
+
+    fig, ax = plt.subplots(figsize=(8,8))
+
+    im = ax.imshow(
+        np.squeeze(data),
+        cmap=cmap,
+        origin="upper",
+        vmin=vmin,
+        vmax=vmax
+    )
+
+    add_latlon(ax, np.squeeze(data))
+
+    ax.set_title(
+        title,
+        fontsize=15,
+        weight="bold"
+    )
+
+    cbar = plt.colorbar(
+        im,
+        ax=ax,
+        shrink=0.85
+    )
+
+    cbar.set_label(
+        cbar_label,
+        fontsize=11
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# CHLOROPHYLL-A (0–8)
+# ============================================================
+plot_map(
+    chl_arr,
+    "Chlorophyll-a Concentration",
+    "jet",
+    "mg m$^{-3}$",
+    vmin=0,
+    vmax=5
+)
+
+
+# ============================================================
+# PREDICTED CHL-A (0–8)
+# ============================================================
+plot_map(
+    pred_arr,
+    "Predicted Chlorophyll-a",
+    "jet",
+    "mg m$^{-3}$",
+    vmin=0,
+    vmax=5
+)
+
+# ============================================================
+# 13. SPATIAL ERROR MAP (PUBLICATION STYLE)
+# ============================================================
+
+fc = test.classify(rf)   # default output = classification
+
+
+def add_error(f):
+
+    pred = ee.Number(f.get("classification"))
+    obs  = ee.Number(f.get("chlor_a"))
+
+    return f.set(
+        "error",
+        pred.subtract(obs)
+    )
+
+
+error_fc = fc.map(add_error)
+
+error_img = (
+    error_fc
+    .reduceToImage(
+        properties=["error"],
+        reducer=ee.Reducer.mean()
+    )
+    .clip(roi)
+)
+
+error_arr = geemap.ee_to_numpy(
+    error_img,
+    region=roi,
+    scale=4000
+)
+
+
+plot_map(
+    error_arr,
+    "Spatial Error Map",
+    "RdBu",
+    "Prediction Error"
+)
+
+
+
+# ============================================================
+# 15. UNCERTAINTY MAP (PUBLICATION STYLE)
+# ============================================================
+
+uncertainty = (
+    combined
+    .classify(rf)
+    .reduceNeighborhood(
+        reducer=ee.Reducer.stdDev(),
+        kernel=ee.Kernel.square(3)
+    )
+    .clip(roi)
+)
+
+uncert_arr = geemap.ee_to_numpy(
+    uncertainty,
+    region=roi,
+    scale=4000
+)
+
+
+plot_map(
+    uncert_arr,
+    "Prediction Uncertainty",
+    "jet",
+    "Std. Dev."
+)
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+df = pd.read_csv("/MODIS_ChlA_TrainPoints_2016.csv")
+print(df.head())
+
+df = df.rename(columns={"longitude":"lon", "latitude":"lat"})
+
+import json
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+# Extract 'lon' and 'lat' from the '.geo' column
+df["lon"] = df[".geo"].apply(lambda x: json.loads(x)["coordinates"][0])
+df["lat"] = df[".geo"].apply(lambda x: json.loads(x)["coordinates"][1])
+
+fig, ax = plt.subplots(figsize=(8,8))
+
+ax.imshow(
+    chl_arr,
+    cmap="viridis",
+    extent=extent,
+    origin="upper"
+)
+
+ax.scatter(
+    df["lon"],
+    df["lat"],
+    s=5,
+    c="black",
+    alpha=0.5
+)
+
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+ax.set_title("Random Points")
+
+plt.show()
+
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+fig, ax = plt.subplots(figsize=(8,8))
+
+# Chlorophyll-a raster with fixed range 0–5
+im = ax.imshow(
+    chl_arr,
+    cmap="viridis",
+    extent=extent,
+    origin="upper",
+    vmin=1,
+    vmax=1
+)
+
+# CSV points overlay
+ax.scatter(
+    df["lon"],
+    df["lat"],
+    s=5,
+    c="black",
+    alpha=0.5
+)
+
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+ax.set_title("Random Points")
+
+
+
+plt.tight_layout()
+plt.show()
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+fig, ax = plt.subplots(figsize=(8,8))
+
+# Chlorophyll-a raster with fixed range
+im = ax.imshow(
+    chl_arr,
+    cmap="viridis",
+    extent=extent,
+    origin="upper",
+    vmin=1,
+    vmax=1
+)
+
+# CSV points overlay (RED points)
+ax.scatter(
+    df["lon"],
+    df["lat"],
+    s=5,
+    c="red",
+    alpha=0.5
+)
+
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+ax.set_title("Random Points")
+
+plt.tight_layout()
+plt.show()
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+fig, ax = plt.subplots(figsize=(8,8))
+
+# Chlorophyll-a raster
+im = ax.imshow(
+    chl_arr,
+    cmap="viridis",
+    extent=extent,
+    origin="upper",
+    vmin=1,
+    vmax=1
+)
+
+# CSV points (RED)
+scatter = ax.scatter(
+    df["lon"],
+    df["lat"],
+    s=5,
+    c="red",
+    alpha=0.5,
+    label="Random Sample Points"
+)
+
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+ax.set_title("Random Points")
+
+# ============================
+# SIDE LEGEND
+# ============================
+ax.legend(
+    loc="center left",
+    bbox_to_anchor=(1, 0.5),
+    frameon=True
+)
+
+plt.tight_layout()
+plt.show()
+
+extent = [60.8383, 71.4731, 19.4404, 25.7649]
+
+fig, ax = plt.subplots(figsize=(8,8))
+
+# Chlorophyll-a raster
+im = ax.imshow(
+    chl_arr,
+    cmap="viridis",
+    extent=extent,
+    origin="upper",
+    vmin=1,
+    vmax=1
+)
+
+# CSV points (RED)
+scatter = ax.scatter(
+    df["lon"],
+    df["lat"],
+    s=5,
+    c="red",
+    alpha=0.6,
+    label="Random Sample Points"
+)
+
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+ax.set_title("Random Points")
+
+# ============================
+# OVERLAY LEGEND (INSIDE MAP)
+# ============================
+legend = ax.legend(
+    loc="lower right",   # good overlay position
+    frameon=True,
+    title="",
+    fontsize=9
+)
+
+# Make legend box semi-transparent (publication style)
+legend.get_frame().set_alpha(0.8)
+legend.get_frame().set_edgecolor("black")
+
+plt.tight_layout()
+plt.show()
